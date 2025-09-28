@@ -23,7 +23,10 @@ POS_MAX = "10000"
 SNOWFLAKE_TIMEOUT_MS = "30000"
 RATE_LIMIT_REQUESTS = "10"
 RATE_LIMIT_WINDOW_S = "60"
-FRONTEND_ORIGIN = "https://<your-pages-domain>"
+# Customize which header carries your upstream API key
+SNOWFLAKE_API_KEY_HEADER = "X-API-Key"
+# Worker-level access control header (optional; if CLIENT_API_KEY not set, auth is disabled)
+CLIENT_API_KEY_HEADER = "X-Client-Key"
 # Optional: enable mock mode by default during dev
 # MOCK = "1"
 

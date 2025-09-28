@@ -9,6 +9,12 @@ HOST="${HOST:-${1:-https://brickyard-worker.rileyseefeldt.workers.dev}}"
 PROMPT="${PROMPT:-a small red car}"
 MODEL_OK="${MODEL_OK:-claude-3-5-sonnet}"
 MODEL_BAD="${MODEL_BAD:-A}"
+CLIENT_HEADER="${CLIENT_HEADER:-X-Client-Key}"
+if [[ -z "${CLIENT_KEY:-}" ]]; then
+  echo "ERROR: CLIENT_KEY is not set. Export your Worker client API key, e.g.:" >&2
+  echo "  export CLIENT_KEY=\"<your-client-key>\"" >&2
+  exit 2
+fi
 
 echo "Using HOST=$HOST"
 echo "PROMPT=$PROMPT"
@@ -26,10 +32,14 @@ req() {
   : >"$body"; : >"$headers"
   if [[ -n "$data" ]]; then
     STATUS=$(curl -sS -o "$body" -D "$headers" -w "%{http_code}" \
-      -H 'content-type: application/json' -X "$method" "$url" -d "$data")
+      -H 'content-type: application/json' \
+      -H "$CLIENT_HEADER: ${CLIENT_KEY}" \
+      -X "$method" "$url" -d "$data")
   else
     STATUS=$(curl -sS -o "$body" -D "$headers" -w "%{http_code}" \
-      -H 'content-type: application/json' -X "$method" "$url")
+      -H 'content-type: application/json' \
+      -H "$CLIENT_HEADER: ${CLIENT_KEY}" \
+      -X "$method" "$url")
   fi
   BODY_FILE="$body"; HEADERS_FILE="$headers"
 }
@@ -146,4 +156,3 @@ after=$(json_get .leaderboard[\"$MODEL_OK\"]) || after=0
 assert "[[ ${after:-0} -ge $(( ${before:-0} + 1 )) ]]" "leaderboard incremented (before=$before, after=$after)"
 
 echo "\nAll tests passed."
-

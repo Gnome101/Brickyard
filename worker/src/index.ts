@@ -43,9 +43,13 @@ export interface Env {
   SNOWFLAKE_TIMEOUT_MS: string;
   RATE_LIMIT_REQUESTS: string;
   RATE_LIMIT_WINDOW_S: string;
-  FRONTEND_ORIGIN: string;
   SNOWFLAKE_ENDPOINT: string;
   SNOWFLAKE_API_KEY?: string;
+  // Optional: customize which header carries the API key (default: "X-API-Key")
+  SNOWFLAKE_API_KEY_HEADER?: string;
+  // Worker access control: require a client API key via header
+  CLIENT_API_KEY?: string;
+  CLIENT_API_KEY_HEADER?: string; // default: X-Client-Key
   // Optional default upstream model name for the new Snowflake API
   // (e.g., "claude-3-5-sonnet"). If not provided, a sensible default is used.
   SNOWFLAKE_MODEL?: string;
@@ -93,10 +97,10 @@ const MAX_BODY_BYTES = 256 * 1024; // Keep POST payloads under 256 KB.
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const requestId = makeRequestId();
-    const corsOrigin = env.FRONTEND_ORIGIN ?? "*";
+    const corsOrigin = "*";
 
     if (request.method === "OPTIONS") {
-      return handleOptions(corsOrigin);
+      return handleOptions(corsOrigin, env);
     }
 
     try {
@@ -105,14 +109,17 @@ export default {
       const handlerContext: HandlerContext = { request, env, ctx, requestId, corsOrigin };
 
       if (url.pathname === "/api/design" && request.method === "POST") {
+        ensureClientAuth(request, env);
         return await handleDesign(handlerContext);
       }
 
       if (url.pathname === "/api/vote" && request.method === "POST") {
+        ensureClientAuth(request, env);
         return await handleVote(handlerContext);
       }
 
       if (url.pathname === "/api/leaderboard" && request.method === "GET") {
+        ensureClientAuth(request, env);
         return await handleLeaderboard(handlerContext);
       }
 
@@ -123,11 +130,11 @@ export default {
       throw new ApiError("NOT_FOUND", "Unknown route", 404);
     } catch (error) {
       if (error instanceof ApiError) {
-        return errorResponse(error, requestId, env.FRONTEND_ORIGIN ?? "*");
+        return errorResponse(error, requestId, corsOrigin);
       }
 
       console.error(`[${requestId}] Unhandled error`, error);
-      return errorResponse(new ApiError("INTERNAL_ERROR", "Unexpected failure", 500), requestId, env.FRONTEND_ORIGIN ?? "*");
+      return errorResponse(new ApiError("INTERNAL_ERROR", "Unexpected failure", 500), requestId, corsOrigin);
     }
   },
 };
@@ -193,12 +200,13 @@ function handleHealthz(corsOrigin: string, requestId: string): Response {
   return ok({ ok: true }, requestId, corsOrigin);
 }
 
-function handleOptions(corsOrigin: string): Response {
+function handleOptions(corsOrigin: string, env: Env): Response {
+  const clientHeader = (env.CLIENT_API_KEY_HEADER?.trim() || "X-Client-Key").toLowerCase();
   return new Response(null, {
     status: 204,
     headers: buildCorsHeaders(corsOrigin, {
       "access-control-allow-methods": "GET,POST,OPTIONS",
-      "access-control-allow-headers": "content-type,x-requested-with",
+      "access-control-allow-headers": `content-type,x-requested-with,${clientHeader}`,
       "access-control-max-age": "86400",
     }),
   });
@@ -231,13 +239,22 @@ function errorResponse(error: ApiError, requestId: string, origin: string): Resp
 }
 
 function buildCorsHeaders(origin: string, additional: Record<string, string> = {}): Headers {
-  const headers = new Headers({
-    "access-control-allow-origin": origin,
-    "access-control-allow-credentials": "true",
-    ...additional,
-  });
-
+  // Open CORS for simplicity; access is controlled via CLIENT_API_KEY.
+  const headers = new Headers({ "access-control-allow-origin": origin, ...additional });
   return headers;
+}
+
+function ensureClientAuth(request: Request, env: Env): void {
+  const required = env.CLIENT_API_KEY?.trim();
+  if (!required) {
+    // No client key configured; allow all (useful for local/dev).
+    return;
+  }
+  const headerName = env.CLIENT_API_KEY_HEADER?.trim() || "X-Client-Key";
+  const provided = request.headers.get(headerName) || request.headers.get(headerName.toLowerCase());
+  if (!provided || provided.trim() !== required) {
+    throw new ApiError("UNAUTHORIZED", "Missing or invalid API key", 401);
+  }
 }
 
 async function loadLeaderboard(env: Env): Promise<Leaderboard> {
@@ -318,7 +335,8 @@ async function fetchLdr(env: Env, prompt: string, modelName: string, seed: numbe
       "content-type": "application/json",
     };
     if (env.SNOWFLAKE_API_KEY) {
-      headers["x-api-key"] = env.SNOWFLAKE_API_KEY;
+      const headerName = env.SNOWFLAKE_API_KEY_HEADER?.trim() || "X-API-Key";
+      headers[headerName] = env.SNOWFLAKE_API_KEY;
     }
 
     const upstreamBody: Record<string, unknown> = {
