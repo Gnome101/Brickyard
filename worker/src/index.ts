@@ -123,6 +123,11 @@ export default {
         return await handleLeaderboard(handlerContext);
       }
 
+      if (url.pathname === "/api/votes/clear" && request.method === "POST") {
+        ensureClientAuth(request, env);
+        return await handleClearVotes(handlerContext);
+      }
+
       if (url.pathname === "/healthz" && request.method === "GET") {
         return handleHealthz(corsOrigin, requestId);
       }
@@ -194,6 +199,23 @@ async function handleLeaderboard({ env, requestId, corsOrigin }: HandlerContext)
   const leaderboard = await loadLeaderboard(env);
 
   return ok({ leaderboard, updated_at: new Date().toISOString() }, requestId, corsOrigin);
+}
+
+async function handleClearVotes({ env, requestId, corsOrigin }: HandlerContext): Promise<Response> {
+  // Ensure table exists, then remove all rows.
+  await env.DB.prepare(
+    "CREATE TABLE IF NOT EXISTS votes (\n" +
+      "    agent_type TEXT NOT NULL,\n" +
+      "    prompt     TEXT NOT NULL,\n" +
+      "    count      INTEGER NOT NULL DEFAULT 0,\n" +
+      "    PRIMARY KEY (agent_type, prompt)\n" +
+      ")"
+  ).run();
+
+  await env.DB.prepare("DELETE FROM votes").run();
+
+  const leaderboard = await loadLeaderboard(env);
+  return ok({ cleared: true, leaderboard }, requestId, corsOrigin);
 }
 
 function handleHealthz(corsOrigin: string, requestId: string): Response {
