@@ -1,0 +1,52 @@
+# Brickyard Worker – wrangler.toml
+name = "brickyard-worker"
+main = "src/index.ts"
+
+# Use a recent date (CF requires a reasonably current one)
+compatibility_date = "2025-09-01"
+
+# If you use Node APIs like Buffer, path, streams, etc., uncomment:
+# compatibility_flags = ["nodejs_compat"]
+
+# REQUIRED to deploy
+account_id = "136551839b55b4dcdac552999b372b3f"
+
+# Use workers.dev URL (no route needed)
+workers_dev = true
+
+# --- Vars (strings) ---
+[vars]
+MODEL_MAX_ITEMS = "200"
+MODEL_MAX_BYTES = "1048576"
+POS_MIN = "-10000"
+POS_MAX = "10000"
+SNOWFLAKE_TIMEOUT_MS = "30000"
+RATE_LIMIT_REQUESTS = "10"
+RATE_LIMIT_WINDOW_S = "60"
+# Customize which header carries your upstream API key
+SNOWFLAKE_API_KEY_HEADER = "X-API-Key"
+# Worker-level access control header (optional; if CLIENT_API_KEY not set, auth is disabled)
+CLIENT_API_KEY_HEADER = "X-Client-Key"
+# Optional: enable mock mode by default during dev
+# MOCK = "1"
+
+# --- KV binding ---
+[[kv_namespaces]]
+binding = "DESIGN_CACHE"
+id = "028367c15bea47269d68c234286fc711"
+# preview_id = "<optional-preview-namespace>"
+
+# --- D1 binding ---
+[[d1_databases]]
+binding = "DB"
+database_name = "lego_db"
+database_id = "70489516-b454-4490-816c-7b83693f6cce"
+
+# Secrets are set via CLI, not here:
+#   wrangler secret put SNOWFLAKE_ENDPOINT
+#   wrangler secret put SNOWFLAKE_API_KEY   # if used
+
+# If you want a custom domain later:
+# [[routes]]
+# pattern = "api.example.com/*"
+# zone_id = "<your-zone-id>"
