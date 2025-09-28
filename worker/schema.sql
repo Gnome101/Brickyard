@@ -17,5 +17,3 @@ CREATE TABLE IF NOT EXISTS votes (
     count      INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (agent_type, prompt)
 );
-
--- Add future migrations below this line (e.g., indices) to keep schema.sql idempotent.

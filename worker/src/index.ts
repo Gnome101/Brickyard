@@ -46,6 +46,9 @@ export interface Env {
   FRONTEND_ORIGIN: string;
   SNOWFLAKE_ENDPOINT: string;
   SNOWFLAKE_API_KEY?: string;
+  // Optional default upstream model name for the new Snowflake API
+  // (e.g., "claude-3-5-sonnet"). If not provided, a sensible default is used.
+  SNOWFLAKE_MODEL?: string;
 }
 
 interface DesignRequest {
@@ -60,8 +63,9 @@ interface VoteRequest {
 }
 
 type Leaderboard = Record<string, number>;
-type AgentDesigns = Record<string, LDrawPart[]>;
-type CacheHits = Record<string, boolean>;
+// Legacy types retained for reference; no longer used in the refactored design handler.
+// type AgentDesigns = Record<string, LDrawPart[]>;
+// type CacheHits = Record<string, boolean>;
 
 interface HandlerContext {
   request: Request;
@@ -129,83 +133,32 @@ export default {
 };
 
 async function handleDesign({ request, env, ctx, requestId, corsOrigin }: HandlerContext): Promise<Response> {
-  const payload = (await request.json().catch(() => ({}))) as Partial<DesignRequest>;
+  // Accept the new simplified contract: single model request, return raw LDraw (.ldr) text.
+  // For compatibility, accept either `model`, `agent_type`, or the first of `agent_types`.
+  const raw = (await request.json().catch(() => ({}))) as Record<string, unknown>;
+  const prompt = typeof raw.prompt === "string" ? raw.prompt.trim() : "";
+  const modelFromArray = Array.isArray(raw.agent_types) && raw.agent_types.length > 0
+    ? String(raw.agent_types[0])
+    : "";
+  const modelName = [
+    typeof raw.model === "string" ? raw.model.trim() : "",
+    typeof raw.agent_type === "string" ? raw.agent_type.trim() : "",
+    modelFromArray.trim(),
+    env.SNOWFLAKE_MODEL && env.SNOWFLAKE_MODEL.trim().length > 0 ? env.SNOWFLAKE_MODEL.trim() : "",
+  ].find((v) => v.length > 0) || "claude-3-5-sonnet";
 
-  const prompt = typeof payload.prompt === "string" ? payload.prompt.trim() : "";
-  const agentTypes = Array.isArray(payload.agent_types)
-    ? Array.from(new Set(payload.agent_types.map((item) => (typeof item === "string" ? item.trim() : "")).filter(Boolean)))
-    : [];
+  const seed = typeof raw.seed === "number" && Number.isFinite(raw.seed)
+    ? Math.floor(raw.seed)
+    : Math.floor(Math.random() * 1_000_000);
 
-  if (!prompt || agentTypes.length === 0) {
-    throw new ApiError("VALIDATION_FAILED", "prompt and agent_types are required", 400, { field: "prompt" });
+  if (!prompt) {
+    throw new ApiError("VALIDATION_FAILED", "prompt is required", 400, { field: "prompt" });
   }
 
   await enforceRateLimit(env, request, requestId);
 
-  const designs: AgentDesigns = {};
-  const cache: CacheHits = {};
-  const baseSeed = typeof payload.seed === "number" && Number.isFinite(payload.seed)
-    ? Math.floor(payload.seed)
-    : Math.floor(Math.random() * 1_000_000);
-
-  for (const [index, agentType] of agentTypes.entries()) {
-    const designKeyValue = await designKey(prompt, agentType);
-
-    // First, attempt to serve from KV hot cache.
-    const cachedJson = await env.DESIGN_CACHE.get(designKeyValue);
-    if (cachedJson) {
-      try {
-        const parsed = JSON.parse(cachedJson);
-        if (Array.isArray(parsed)) {
-          designs[agentType] = parsed as LDrawPart[];
-          cache[agentType] = true;
-          continue;
-        }
-        console.warn(`[${requestId}] Cached model for ${agentType} was not an array, regenerating.`);
-      } catch (parseError) {
-        console.warn(`[${requestId}] Failed to parse KV cache for ${agentType}:`, parseError);
-      }
-    }
-
-    // Fall back to D1 persistent store if KV miss.
-    const row = await env.DB.prepare("SELECT model_json FROM designs WHERE hash_id = ?1")
-      .bind(designKeyValue)
-      .first<{ model_json: string } | null>();
-
-    if (row?.model_json) {
-      try {
-        const parsed = JSON.parse(row.model_json);
-        if (Array.isArray(parsed)) {
-          designs[agentType] = parsed as LDrawPart[];
-          cache[agentType] = true;
-          ctx.waitUntil(env.DESIGN_CACHE.put(designKeyValue, row.model_json));
-          continue;
-        }
-        console.warn(`[${requestId}] Stored model for ${agentType} was not an array, regenerating.`);
-      } catch (parseError) {
-        console.warn(`[${requestId}] Failed to parse D1 payload for ${agentType}:`, parseError);
-        // Continue to regenerate below.
-      }
-    }
-
-    // Full miss: request fresh model from Snowflake teammate and persist.
-    const agentSeed = baseSeed + index;
-    const generatedParts = await generateModel(env, prompt, agentType, agentSeed, requestId);
-    const { parts, json } = validateModel(generatedParts, env);
-
-    await env.DB.prepare(
-      "INSERT OR REPLACE INTO designs (hash_id, prompt, agent_type, model_json) VALUES (?1, ?2, ?3, ?4)"
-    )
-      .bind(designKeyValue, prompt, agentType, json)
-      .run();
-
-    ctx.waitUntil(env.DESIGN_CACHE.put(designKeyValue, json));
-
-    designs[agentType] = parts;
-    cache[agentType] = false;
-  }
-
-  return ok({ designs, cache }, requestId, corsOrigin);
+  const ldr = await fetchLdr(env, prompt, modelName, seed, requestId);
+  return okText(ldr, requestId, corsOrigin);
 }
 
 async function handleVote({ request, env, requestId, corsOrigin }: HandlerContext): Promise<Response> {
@@ -257,6 +210,12 @@ function ok<T extends Record<string, unknown>>(data: T, requestId: string, origi
     status,
     headers: buildCorsHeaders(origin, { "content-type": "application/json" }),
   });
+}
+
+function okText(body: string, requestId: string, origin: string, status = 200): Response {
+  // Return raw LDraw text; include request ID as a response header for tracing.
+  const headers = buildCorsHeaders(origin, { "content-type": "text/plain; charset=utf-8", "x-request-id": requestId });
+  return new Response(body, { status, headers });
 }
 
 function errorResponse(error: ApiError, requestId: string, origin: string): Response {
@@ -337,14 +296,16 @@ async function rateLimit(env: Env, identity: string, windowSeconds: number, maxR
   return { allowed: true };
 }
 
-async function generateModel(env: Env, prompt: string, agentType: string, seed: number, requestId: string): Promise<unknown> {
+async function fetchLdr(env: Env, prompt: string, modelName: string, seed: number, requestId: string): Promise<string> {
   if (!env.SNOWFLAKE_ENDPOINT || env.SNOWFLAKE_ENDPOINT.trim().length === 0) {
     console.warn(`[${requestId}] SNOWFLAKE_ENDPOINT not configured; falling back to mock model.`);
-    return generateMockModel(prompt, agentType, seed);
+    const parts = generateMockModel(prompt, modelName, seed);
+    return partsToLdr(parts);
   }
 
   if (env.SNOWFLAKE_ENDPOINT.startsWith("mock:")) {
-    return generateMockModel(prompt, agentType, seed, env.SNOWFLAKE_ENDPOINT);
+    const parts = generateMockModel(prompt, modelName, seed, env.SNOWFLAKE_ENDPOINT);
+    return partsToLdr(parts);
   }
 
   const timeoutMsRaw = Number(env.SNOWFLAKE_TIMEOUT_MS || "5000");
@@ -360,10 +321,18 @@ async function generateModel(env: Env, prompt: string, agentType: string, seed: 
       headers["x-api-key"] = env.SNOWFLAKE_API_KEY;
     }
 
+    const upstreamBody: Record<string, unknown> = {
+      prompt,
+      model: modelName,
+      // Legacy fields (ignored by the new API, used by local mock and older upstreams):
+      agent_type: modelName,
+      seed,
+    };
+
     const response = await fetch(env.SNOWFLAKE_ENDPOINT, {
       method: "POST",
       headers,
-      body: JSON.stringify({ prompt, agent_type: agentType, seed }),
+      body: JSON.stringify(upstreamBody),
       signal: controller.signal,
     });
 
@@ -373,11 +342,21 @@ async function generateModel(env: Env, prompt: string, agentType: string, seed: 
 
     try {
       const payload = await response.json();
-      if (!payload || typeof payload !== "object" || !Array.isArray((payload as { model?: unknown }).model)) {
-        throw new ApiError("GENERATION_FAILED", "Invalid upstream payload", 502);
+
+      // New upstream shape: { success: true, ldrContent: string, ... }
+      const success = (payload as { success?: unknown }).success;
+      const ldrContent = (payload as { ldrContent?: unknown }).ldrContent;
+      if (success === true && typeof ldrContent === "string" && ldrContent.trim().length > 0) {
+        return ldrContent as string;
       }
 
-      return (payload as { model: unknown }).model;
+      // Compatibility path: local mock or legacy upstream returns { model: LDrawPart[] }
+      if (payload && typeof payload === "object" && Array.isArray((payload as { model?: unknown }).model)) {
+        const parts = (payload as { model: LDrawPart[] }).model;
+        return partsToLdr(parts);
+      }
+
+      throw new ApiError("GENERATION_FAILED", "Invalid upstream payload", 502);
     } catch (error) {
       if (error instanceof ApiError) {
         throw error;
@@ -397,6 +376,193 @@ async function generateModel(env: Env, prompt: string, agentType: string, seed: 
   } finally {
     clearTimeout(timeoutId);
   }
+}
+
+/**
+ * Convert an array of LDrawPart entries to LDraw .ldr text.
+ * Emits type-1 lines with a rotation matrix derived from Euler angles.
+ */
+function partsToLdr(parts: LDrawPart[]): string {
+  const lines: string[] = [];
+  lines.push("0 Brickyard Model");
+  for (const p of parts) {
+    const [rx, ry, rz] = p.rot;
+    const M = eulerToMatrix(rx, ry, rz);
+    const [x, y, z] = p.pos;
+    // 1 color x y z a b c d e f g h i part.dat
+    lines.push(
+      [
+        "1",
+        String(Math.floor(p.color)),
+        String(x),
+        String(y),
+        String(z),
+        String(M[0][0]),
+        String(M[0][1]),
+        String(M[0][2]),
+        String(M[1][0]),
+        String(M[1][1]),
+        String(M[1][2]),
+        String(M[2][0]),
+        String(M[2][1]),
+        String(M[2][2]),
+        p.ldraw_part,
+      ].join(" ")
+    );
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Parse a minimal subset of LDraw .ldr content into our LDrawPart[] format.
+ * We only process type-1 lines (subfile references):
+ *   1 color x y z a b c d e f g h i part.dat
+ * Rotation matrix is converted to Euler angles in 90° steps by search.
+ */
+function parseLdrToParts(ldr: string, env: Env): LDrawPart[] {
+  const lines = ldr.split(/\r?\n/);
+  const parts: LDrawPart[] = [];
+  const maxItemsRaw = Number(env.MODEL_MAX_ITEMS || "200");
+  const maxItems = Number.isFinite(maxItemsRaw) && maxItemsRaw > 0 ? Math.floor(maxItemsRaw) : 200;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("0 ") || trimmed === "0") {
+      continue; // comments/meta
+    }
+    if (!trimmed.startsWith("1 ")) {
+      continue; // ignore other line types
+    }
+
+    // Tokenize. Some .ldr files use multiple spaces; split on whitespace.
+    const tokens = trimmed.split(/\s+/);
+    // Expect: 1 color x y z a b c d e f g h i file
+    if (tokens.length < 15) {
+      continue; // malformed; skip rather than fail the whole request
+    }
+
+    const color = Number(tokens[1]);
+    const x = Number(tokens[2]);
+    const y = Number(tokens[3]);
+    const z = Number(tokens[4]);
+
+    const a = Number(tokens[5]);
+    const b = Number(tokens[6]);
+    const c = Number(tokens[7]);
+    const d = Number(tokens[8]);
+    const e = Number(tokens[9]);
+    const f = Number(tokens[10]);
+    const g = Number(tokens[11]);
+    const h = Number(tokens[12]);
+    const i = Number(tokens[13]);
+
+    const file = tokens[14];
+
+    if (!Number.isFinite(color) || typeof file !== "string" || !/\.dat$/i.test(file)) {
+      continue;
+    }
+
+    // Round near-integers to -1/0/1 to stabilize comparison.
+    const M: number[][] = [
+      [roundToUnit(a), roundToUnit(b), roundToUnit(c)],
+      [roundToUnit(d), roundToUnit(e), roundToUnit(f)],
+      [roundToUnit(g), roundToUnit(h), roundToUnit(i)],
+    ];
+
+    const rot = findEulerFromMatrix(M) ?? [0, 0, 0];
+
+    parts.push({
+      ldraw_part: file,
+      color: Math.max(0, Math.min(1023, Math.floor(color))),
+      pos: [x, y, z],
+      rot,
+    });
+
+    if (parts.length >= maxItems) {
+      break;
+    }
+  }
+
+  return parts;
+}
+
+function roundToUnit(n: number): -1 | 0 | 1 {
+  if (!Number.isFinite(n)) return 0;
+  const r = Math.round(n);
+  return (r < 0 ? -1 : r > 0 ? 1 : 0) as -1 | 0 | 1;
+}
+
+// Build a rotation matrix for rx, ry, rz in degrees (multiples of 90), order Z * Y * X.
+function eulerToMatrix(rx: 0 | 90 | 180 | 270, ry: 0 | 90 | 180 | 270, rz: 0 | 90 | 180 | 270): number[][] {
+  const Rx = (deg: number): number[][] => {
+    const c = Math.round(Math.cos((deg * Math.PI) / 180));
+    const s = Math.round(Math.sin((deg * Math.PI) / 180));
+    return [
+      [1, 0, 0],
+      [0, c, -s],
+      [0, s, c],
+    ];
+  };
+  const Ry = (deg: number): number[][] => {
+    const c = Math.round(Math.cos((deg * Math.PI) / 180));
+    const s = Math.round(Math.sin((deg * Math.PI) / 180));
+    return [
+      [c, 0, s],
+      [0, 1, 0],
+      [-s, 0, c],
+    ];
+  };
+  const Rz = (deg: number): number[][] => {
+    const c = Math.round(Math.cos((deg * Math.PI) / 180));
+    const s = Math.round(Math.sin((deg * Math.PI) / 180));
+    return [
+      [c, -s, 0],
+      [s, c, 0],
+      [0, 0, 1],
+    ];
+  };
+
+  return matMul(matMul(Rz(rz), Ry(ry)), Rx(rx));
+}
+
+function matMul(A: number[][], B: number[][]): number[][] {
+  const out: number[][] = [
+    [0, 0, 0],
+    [0, 0, 0],
+    [0, 0, 0],
+  ];
+  for (let r = 0; r < 3; r += 1) {
+    for (let c = 0; c < 3; c += 1) {
+      out[r][c] = A[r][0] * B[0][c] + A[r][1] * B[1][c] + A[r][2] * B[2][c];
+      out[r][c] = roundToUnit(out[r][c]);
+    }
+  }
+  return out;
+}
+
+function matricesEqual(A: number[][], B: number[][]): boolean {
+  for (let r = 0; r < 3; r += 1) {
+    for (let c = 0; c < 3; c += 1) {
+      if (roundToUnit(A[r][c]) !== roundToUnit(B[r][c])) return false;
+    }
+  }
+  return true;
+}
+
+// Brute-force search over 4^3 Euler combinations in 90° steps.
+function findEulerFromMatrix(M: number[][]): [0 | 90 | 180 | 270, 0 | 90 | 180 | 270, 0 | 90 | 180 | 270] | null {
+  const angles: Array<0 | 90 | 180 | 270> = [0, 90, 180, 270];
+  for (const rx of angles) {
+    for (const ry of angles) {
+      for (const rz of angles) {
+        const candidate = eulerToMatrix(rx, ry, rz);
+        if (matricesEqual(candidate, M)) {
+          return [rx, ry, rz];
+        }
+      }
+    }
+  }
+  return null;
 }
 
 function generateMockModel(prompt: string, agentType: string, seed: number, endpoint = "mock:basic"): LDrawPart[] {

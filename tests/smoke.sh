@@ -11,16 +11,11 @@ payload_design=$(cat <<JSON
 JSON
 )
 
-echo "# POST /api/design"
-response_design=$(curl -sS -X POST "$HOST/api/design" \
+echo "# POST /api/design (returns LDraw .ldr text)"
+curl -sS -X POST "$HOST/api/design" \
   -H 'content-type: application/json' \
-  -d "$payload_design")
-
-if command -v jq &>/dev/null; then
-  echo "$response_design" | jq '.'
-else
-  echo "$response_design"
-fi
+  -d "$payload_design"
+echo
 
 echo "# POST /api/vote"
 response_vote=$(curl -sS -X POST "$HOST/api/vote" \
